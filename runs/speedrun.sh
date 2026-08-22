@@ -1,14 +1,22 @@
 #!/bin/bash
 
 # This script is configured to train your own GPT-2 grade LLM (pretraining + finetuning)
-# It is designed to run on a blank 8XH100 GPU node and takes approximately 1.5 hours to complete.
 
-# 1) Example launch (simplest):
+# 1) Example launch (full GPT-2 grade model):
 # bash runs/speedrun.sh
-# 2) Example launch in a screen session (because the run takes ~1.5 hours):
+# 2) Example launch (small fast model):
+# bash runs/speedrun.sh small
+# 3) Example launch in a screen session:
 # screen -L -Logfile runs/speedrun.log -S speedrun bash runs/speedrun.sh
-# 3) Example launch with wandb logging, but see below for setting up wandb first:
-# WANDB_RUN=speedrun screen -L -Logfile runs/speedrun.log -S speedrun bash runs/speedrun.sh
+# 4) Example launch with custom GPU count and wandb logging:
+# NPROC_PER_NODE=8 WANDB_RUN=speedrun bash runs/speedrun.sh small
+
+# Model size: "full" (default GPT-2 grade) or "small" (fast 6-layer model)
+MODEL_SIZE="${1:-full}"
+if [ "$MODEL_SIZE" != "small" ] && [ "$MODEL_SIZE" != "full" ]; then
+    echo "Unknown model size: $MODEL_SIZE. Expected 'small' or 'full' (default)."
+    exit 1
+fi
 
 # Default intermediate artifacts directory is in ~/.cache/nanochat
 export OMP_NUM_THREADS=1
@@ -27,6 +35,12 @@ uv sync --extra gpu
 # activate venv so that `python` uses the project's venv instead of system python
 source .venv/bin/activate
 
+# Auto-detect number of GPUs available (unless explicitly overridden)
+if [ -z "$NPROC_PER_NODE" ]; then
+    NPROC_PER_NODE=$(python -c "import torch; print(torch.cuda.device_count() if torch.cuda.is_available() else 8)" 2>/dev/null || echo 8)
+fi
+echo "Running ($MODEL_SIZE model) on $NPROC_PER_NODE GPU(s)..."
+
 # -----------------------------------------------------------------------------
 # wandb setup
 # If you wish to use wandb for logging (it's nice!, recommended).
@@ -43,37 +57,77 @@ fi
 # Tokenizer
 
 # Download the first ~2B characters of pretraining dataset
-# each data shard is ~250M chars
-# so we download 2e9 / 250e6 = 8 data shards at this point
-# each shard is ~100MB of text (compressed), so this is about ~800MB of data on disk
-# look at dev/repackage_data_reference.py for details on how this data was prepared
+# each data shard is ~250M chars, so 8 shards = ~2B chars (~800MB compressed on disk)
 python -m nanochat.dataset -n 8
-# Immediately also kick off downloading more shards in the background while tokenizer trains
-# Approximately 150 shards are needed for GPT-2 capability pretraining, add 20 for padding.
-# The maximum total number of shards available in the entire dataset is 6542.
-python -m nanochat.dataset -n 170 &
-DATASET_DOWNLOAD_PID=$!
+
+if [ "$MODEL_SIZE" != "small" ]; then
+    # Immediately also kick off downloading more shards in the background while tokenizer trains
+    # Approximately 150 shards are needed for GPT-2 capability pretraining, add 20 for padding.
+    # The maximum total number of shards available in the entire dataset is 6542.
+    python -m nanochat.dataset -n 170 &
+    DATASET_DOWNLOAD_PID=$!
+fi
+
 # train the tokenizer with vocab size 2**15 = 32768 on ~2B characters of data
-python -m scripts.tok_train
+python -m scripts.tok_train --max-chars=2000000000
 # evaluate the tokenizer (report compression ratio etc.)
 python -m scripts.tok_eval
 
 # -----------------------------------------------------------------------------
 # Base model (pretraining)
-echo "Waiting for dataset download to complete..."
-wait $DATASET_DOWNLOAD_PID
 
-# d24 model (slightly undertrained to beat GPT-2 => decrease data:params ratio from compute optimal 10.5 (default) to 8)
-torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- --depth=24 --target-param-data-ratio=8 --device-batch-size=16 --fp8 --run=$WANDB_RUN
-# evaluate the model: CORE metric, BPB on train/val, and draw samples
-torchrun --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-size=16
+if [ "$MODEL_SIZE" == "small" ]; then
+    # Small 6-layer model (adapted from runcpu.sh, fast on low-tier/mid-tier GPUs)
+    torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- \
+        --depth=6 \
+        --head-dim=64 \
+        --window-pattern=L \
+        --max-seq-len=512 \
+        --device-batch-size=32 \
+        --total-batch-size=16384 \
+        --eval-every=200 \
+        --eval-tokens=524288 \
+        --core-metric-every=-1 \
+        --sample-every=100 \
+        --num-iterations=7500 \
+        --run=$WANDB_RUN
+
+    # Evaluate the base model (quick evaluation)
+    torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_eval -- \
+        --device-batch-size=32 \
+        --split-tokens=16384 \
+        --max-per-task=16
+else
+    echo "Waiting for dataset download to complete..."
+    wait $DATASET_DOWNLOAD_PID
+
+    # d24 model (slightly undertrained to beat GPT-2 => decrease data:params ratio from compute optimal 10.5 (default) to 8)
+    torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=24 --target-param-data-ratio=8 --device-batch-size=16 --fp8 --run=$WANDB_RUN
+
+    # evaluate the model: CORE metric, BPB on train/val, and draw samples
+    torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_eval -- --device-batch-size=16
+fi
 
 # -----------------------------------------------------------------------------
 # SFT (teach the model conversation special tokens, tool use, multiple choice)
 
-# run SFT and eval the model
-torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft -- --run=$WANDB_RUN
-torchrun --standalone --nproc_per_node=8 -m scripts.chat_eval -- -i sft
+if [ "$MODEL_SIZE" == "small" ]; then
+    # SFT for small model (with warmup and lower initial LR for training stability)
+    torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_sft -- \
+        --eval-every=200 \
+        --chatcore-every=1000 \
+        --eval-tokens=524288 \
+        --num-iterations=4000 \
+        --warmup-ratio=0.2 \
+        --init-lr-frac=0.00003 \
+        --run=$WANDB_RUN
+else
+    # Full SFT
+    torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_sft -- --run=$WANDB_RUN
+fi
+
+# Run chat evaluation
+torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- -i sft
 
 # chat with the model over CLI! Leave out the -p to chat interactively
 # python -m scripts.chat_cli -p "Why is the sky blue?"
